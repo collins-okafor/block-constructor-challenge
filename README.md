@@ -44,4 +44,4 @@ This Rust program represents a simple mempool miner that loads transactions from
 ## Example
 
 ```bash
-$ cargo run mempool.csv
+$ cargo run
