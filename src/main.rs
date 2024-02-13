@@ -1,192 +1,153 @@
-// use std::fs::File;
-// use std::io::{self, BufRead};
-// use std::path::Path;
-// use std::collections::HashMap;
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{prelude::*, BufReader},
+    path::Path,
+};
 
-// // Define a structure to represent transactions
-// #[derive(Debug, Clone)]
-// struct Transaction {
-//     txid: String,
-//     fee: u32,
-//     weight: u32,
-//     parent_txids: Vec<String>,
-// }
+pub const MAX_BLOCK_TX_WEIGHT: u32 = 4_000_000;
 
-// impl Transaction {
-//     fn new(txid: String, fee: u32, weight: u32, parent_txids: Vec<String>) -> Self {
-//         Transaction {
-//             txid,
-//             fee,
-//             weight,
-//             parent_txids,
-//         }
-//     }
-// }
+fn main() {
+    let mut miner = Miner::load_mempool("mempool.csv");
+    miner.mine();
 
-// fn main() {
-//     // Read mempool data from CSV file
-//     if let Ok(lines) = read_lines("./mempool.csv") {
-//         // Initialize a vector to store transaction data
-//         let mut transactions: Vec<Transaction> = vec![];
+    for block in miner.finalized.iter() {
+        for tx in block {
+            println!("{}", &tx.txid);
+        }
+        println!("\n\n",);
+    }
+}
 
-//         // Iterate over lines in the CSV file
-//         for line in lines {
-//             if let Ok(row) = line {
-//                 // Split the row by commas and extract transaction data
-//                 let cols: Vec<&str> = row.split(',').collect();
-//                 let txid = cols[0].to_string();
-//                 let fee: u32 = cols[1].parse().unwrap();
-//                 let weight: u32 = cols[2].parse().unwrap();
-//                 let parent_txids: Vec<String> = if cols.len() > 3 {
-//                     cols[3].split(';').map(|s| s.to_string()).collect()
-//                 } else {
-//                     Vec::new()
-//                 };
+#[derive(Debug, PartialEq, Eq, Default)]
+pub struct Miner {
+    mempool: Vec<Transaction>,
+    finalized_txids: HashSet<String>,
+    finalized: Vec<Vec<Transaction>>,
+}
 
-//                 // Create a new Transaction object and add it to the transactions vector
-//                 let transaction = Transaction::new(txid, fee, weight, parent_txids);
-//                 transactions.push(transaction);
-//             }
-//         }
+impl Miner {
+    pub fn load_mempool(path_to_file: impl AsRef<Path>) -> Self {
+        let file = File::open(path_to_file.as_ref()).unwrap();
+        let buffer = BufReader::new(file);
+        let mut init_miner = Miner::default();
 
-//         // Initialize variables for block construction
-//         let max_weight = 4000000;
-//         let mut block_weight = 0;
-//         let mut selected_txids: HashMap<String, bool> = HashMap::new(); // Use HashMap for efficiency
+        buffer.lines().for_each(|line| {
+            let line = line.unwrap();
+            let tx = Transaction::parser(line.trim());
 
-//         // Sort transactions by fee in descending order
-//         let mut cloned_transactions = transactions.clone();
-//         cloned_transactions.sort_by_key(|tx| -(tx.fee as i32));
+            init_miner.mempool.push(tx);
+        });
 
-//         // Construct the block by selecting transactions with maximum fee
-//         for transaction in cloned_transactions {
-//             // Check if adding the transaction exceeds block weight limit or if it conflicts with parents
-//             if block_weight + transaction.weight <= max_weight
-//                 && transaction
-//                     .parent_txids
-//                     .iter()
-//                     .all(|parent_txid| selected_txids.contains_key(parent_txid))
-//             {
-//                 // Add the transaction to the block
-//                 block_weight += transaction.weight;
-//                 selected_txids.insert(transaction.txid.clone(), true);
-//             }
-//         }
+        init_miner.mempool.sort();
 
-//         // Output selected transactions in the correct order
-//         if selected_txids.is_empty() {
-//             println!("No valid block could be constructed.");
-//         } else {
-//             for txid in selected_txids.keys() {
-//                 println!("{}", txid);
-//             }
-//         }
-//     } else {
-//         eprintln!("Error reading mempool.csv: {}", io::Error::last_os_error());
-//     }
-// }
+        init_miner
+    }
 
-// // Function to read lines from a file
-// // fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::
+    pub fn mine(&mut self) {
+        let mut current_block_weight = 0u32;
+        let mut current_block = Vec::<Transaction>::new();
+        let mut skipped = Vec::<Transaction>::new();
 
-// // Function to read lines from a file
-// fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
-// where
-//     P: AsRef<Path>,
-// {
-//     let file = File::open(filename)?;
-//     Ok(io::BufReader::new(file).lines())
-// }
+        while let Some(mempool_tx) = self.mempool.pop() {
+            if current_block_weight + mempool_tx.weight > MAX_BLOCK_TX_WEIGHT
+                || self.mempool.is_empty()
+            {
+                for tx in current_block.iter() {
+                    self.finalized_txids.insert(tx.txid.clone());
+                }
+                self.finalized.push(current_block.clone());
+                current_block.clear();
 
-use std::fs::File;
-use std::io::{self, BufRead};
-use std::path::Path;
-use std::collections::HashSet;
+                current_block_weight = 0;
 
-// Define a structure to represent transactions
-#[derive(Debug, Clone)]
-struct Transaction {
+                while let Some(skipped_tx) = skipped.pop() {
+                    self.mempool.push(skipped_tx);
+                    self.mempool.sort();
+                }
+            }
+
+            let has_no_parents = mempool_tx.parent_txids.is_empty();
+
+            if has_no_parents {
+                current_block_weight += mempool_tx.weight;
+                current_block.push(mempool_tx);
+            } else {
+                let mut all_parents_mined = Vec::<bool>::new();
+
+                for current_parent_txid in mempool_tx.parent_txids.iter() {
+                    let contains_tx = self.finalized_txids.contains(current_parent_txid);
+                    all_parents_mined.push(contains_tx);
+                }
+
+                let mut should_be_skipped = false;
+
+                all_parents_mined.iter().for_each(|element| {
+                    if !element {
+                        should_be_skipped = true;
+                    }
+                });
+
+                if !should_be_skipped {
+                    current_block_weight += mempool_tx.weight;
+                    current_block.push(mempool_tx);
+                } else {
+                    skipped.push(mempool_tx);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Default, Clone, Hash)]
+pub struct Transaction {
     txid: String,
-    fee: u32,
+    fee: u64,
     weight: u32,
     parent_txids: Vec<String>,
 }
 
 impl Transaction {
-    fn new(txid: String, fee: u32, weight: u32, parent_txids: Vec<String>) -> Self {
-        Transaction {
-            txid,
-            fee,
-            weight,
-            parent_txids,
+    fn parser(value: &str) -> Self {
+        let mut outcome = Self::default();
+        let tx_data = value.split(',').collect::<Vec<&str>>();
+
+        let txid = tx_data.first().unwrap().trim();
+        let fee = tx_data.get(1).unwrap().trim();
+        let weight = tx_data.get(2).unwrap().trim();
+        let parents = tx_data.get(3);
+
+        outcome.txid = txid.trim().to_owned();
+        outcome.fee = fee.parse::<u64>().unwrap();
+        outcome.weight = weight.parse::<u32>().unwrap();
+
+        if let Some(parent_exists) = parents {
+            parent_exists.trim().split(';').for_each(|parent| {
+                if !parent.is_empty() {
+                    outcome.parent_txids.push(parent.trim().to_owned());
+                }
+            });
         }
+
+        // Reverse the parents order since ancestors of a transaction would need to be in
+        // the mempool for a UTXO to be valid
+        outcome.parent_txids.reverse();
+
+        outcome
     }
 }
 
-fn main() {
-    // Read mempool data from CSV file
-    if let Ok(lines) = read_lines("./mempool.csv") {
-        // Initialize a vector to store transaction data
-        let mut transactions: Vec<Transaction> = vec![];
-
-        // Iterate over lines in the CSV file
-        for line in lines {
-            if let Ok(row) = line {
-                // Split the row by commas and extract transaction data
-                let cols: Vec<&str> = row.split(',').collect();
-                let txid = cols[0].to_string();
-                let fee: u32 = cols[1].parse().unwrap();
-                let weight: u32 = cols[2].parse().unwrap();
-                let parent_txids: Vec<String> = if cols.len() > 3 {
-                    cols[3].split(';').map(|s| s.to_string()).collect()
-                } else {
-                    Vec::new()
-                };
-
-                // Create a new Transaction object and add it to the transactions vector
-                let transaction = Transaction::new(txid, fee, weight, parent_txids.clone());
-                println!("Read transaction: {:?}", &transaction);
-                transactions.push(transaction);
-            }
-        }
-
-        // Initialize variables for block construction
-        let max_weight = 4000000;
-        let mut block_weight = 0;
-        let mut selected_txids: HashSet<String> = HashSet::new();
-
-        // Sort transactions by fee in descending order
-        let mut cloned_transactions = transactions.clone();
-        cloned_transactions.sort_by_key(|tx| -(tx.fee as i32));
-
-        // Construct the block by selecting transactions with maximum fee
-        for transaction in cloned_transactions {
-            // Check if adding the transaction exceeds block weight limit or if it conflicts with parents
-            if block_weight + transaction.weight <= max_weight
-                && transaction
-                    .parent_txids
-                    .iter()
-                    .all(|parent_txid| selected_txids.contains(parent_txid))
-            {
-                // Add the transaction to the block
-                block_weight += transaction.weight;
-                selected_txids.insert(transaction.txid.clone());
-                println!("Added transaction to block: {}", transaction.txid);
-            }
-        }
-
-        // Output selected transactions in the correct order
-        for txid in &selected_txids {
-            println!("{}", txid);
-        }
+impl PartialOrd for Transaction {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
-// Function to read lines from a file
-fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
-where
-    P: AsRef<Path>,
-{
-    let file = File::open(filename)?;
-    Ok(io::BufReader::new(file).lines())
+impl Ord for Transaction {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        let self_fee_rate = self.fee / self.weight as u64;
+        let other_fee_rate = other.fee / other.weight as u64;
+
+        other_fee_rate.cmp(&self_fee_rate)
+    }
 }
